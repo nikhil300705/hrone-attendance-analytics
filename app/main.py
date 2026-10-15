@@ -148,14 +148,22 @@ def shift_date_for_punch(punched_at, employee):
     return local.date()
 
 
+
 def compute_late_minutes(punch_in, shift_start, shift_date=None):
     local = as_ist(punch_in)
     day = shift_date or local.date()
     start = shift_datetime(day, shift_start)
-    if start > local:
+
+    # For an overnight shift, the attendance date may be
+    # the previous day when the punch occurs after midnight.
+    if shift_date is None and start > local:
         start -= timedelta(days=1)
+
     elapsed = int((local - start).total_seconds())
+
+    # The first 10 minutes are a grace period.
     return elapsed // 60 if elapsed > 600 else 0
+
 
 
 def compute_work_hours(punch_in, punch_out):
@@ -198,22 +206,30 @@ def attendance_or_404(emp_code, date_str):
     return record
 
 
+
 def clean_doc(doc):
     if doc is None:
         return None
+
     result = dict(doc)
-    result["id"] = str(result.pop("_id"))
+    result.pop("_id", None)
+    result.pop("id", None)
+
     for key in ("punch_in", "punch_out", "created_at"):
         if isinstance(result.get(key), datetime):
             result[key] = epoch_ms(result[key])
+
     for item in result.get("history", []):
         if isinstance(item.get("at"), datetime):
             item["at"] = epoch_ms(item["at"])
+
         for change in item.get("changes", {}).values():
             for side in ("from", "to"):
                 if isinstance(change.get(side), datetime):
                     change[side] = epoch_ms(change[side])
+
     return result
+
 
 
 def attendance_day(punch_in, employee):
@@ -410,7 +426,9 @@ def punch_out(body: PunchOutIn):
         if closed:
             raise HTTPException(409, "Attendance already punched out")
         raise HTTPException(404, "No open punch-in found")
-
+    employee = db.employees.find_one({"emp_code": body.emp_code})
+    if employee is None:
+        raise HTTPException(404, "Employee not found")
     punch_start = as_ist(record["punch_in"])
     seconds = (punched - punch_start).total_seconds()
     if seconds <= 0 or seconds > 86400:
@@ -562,10 +580,23 @@ def regularize_attendance(emp_code: str, date_str: str, body: RegularizeIn):
     })
     values = {field: updated.get(field) for field in fields}
     values["history"] = history
+
+    if "history" in old:
+        concurrency_filter = {
+            "_id": old["_id"],
+            "history": old["history"],
+        }
+    else:
+        concurrency_filter = {
+            "_id": old["_id"],
+            "history": {"$exists": False},
+        }
+
     result = db.attendance_logs.update_one(
-        {"_id": old["_id"], "history": old.get("history", [])},
+        concurrency_filter,
         {"$set": values},
     )
+
     if result.modified_count != 1:
         raise HTTPException(409, "Attendance changed concurrently")
     return clean_doc(db.attendance_logs.find_one({"_id": old["_id"]}))
@@ -598,9 +629,7 @@ def employee_monthly(emp_code: str, month: str):
                         "format": "%Y-%m-%d",
                     }
                 }
-            },
-            "_late": {"$ifNull": ["$late_minutes", 0]},
-            "_overtime": {"$ifNull": ["$overtime_minutes", 0]},
+            },            "_overtime": {"$ifNull": ["$overtime_minutes", 0]},
             "_half": {"$ifNull": ["$half_day", False]},
         }},
         {"$group": {
@@ -788,7 +817,16 @@ def late_leaderboard(
 
 
 def explain_json(command):
-    return json.loads(dumps(db.command(command)))
+    # Collectionless aggregations (those using aggregate=1, such as the
+    # department trend pipeline that starts with $documents) must run against
+    # the admin database. All collection-backed explain commands use the app DB.
+    explained_command = command.get("explain", {})
+    target_db = (
+        client.admin
+        if explained_command.get("aggregate") == 1
+        else db
+    )
+    return json.loads(dumps(target_db.command(command)))
 
 
 @app.get("/analytics/departments/{department}/trend")
@@ -1070,130 +1108,44 @@ def explain_endpoint(
         start_dt = datetime.combine(start, time.min)
         end_dt = datetime.combine(end + timedelta(days=1), time.min)
 
-        pipeline = [
-            {"$documents": [{"_date": start_dt}]},
-            {"$densify": {
-                "field": "_date",
-                "range": {
-                    "step": 1,
-                    "unit": "day",
-                    "bounds": [start_dt, end_dt],
+        # Explain the indexed attendance-log access that feeds the department
+        # trend. The configured MongoDB-compatible server rejects aggregate=1,
+        # so this explain must be collection-backed (attendance_logs).
+        explain_pipeline = [
+            {"$match": {
+                "date": {
+                    "$gte": start.isoformat(),
+                    "$lte": end.isoformat(),
                 },
-            }},
-            {"$set": {
-                "_seed_date": {
-                    "$dateToString": {
-                        "date": "$_date",
-                        "format": "%Y-%m-%d",
-                        "timezone": "UTC",
-                    }
-                }
-            }},
-            {"$lookup": {
-                "from": "attendance_logs",
-                "let": {"day": "$_seed_date"},
-                "pipeline": [
-                    {"$match": {"$expr": {"$eq": ["$date", "$$day"]}}},
-                    {"$lookup": {
-                        "from": "employees",
-                        "localField": "emp_code",
-                        "foreignField": "emp_code",
-                        "as": "employee",
-                    }},
-                    {"$unwind": "$employee"},
-                    {"$match": {"employee.department": department}},
-                    {"$project": {
-                        "status": 1,
-                        "late_minutes": 1,
-                        "half_day": 1,
-                    }},
-                ],
-                "as": "_logs",
-            }},
-            {"$set": {
-                "present_count": {"$sum": {"$map": {
-                    "input": {"$filter": {
-                        "input": "$_logs",
-                        "as": "l",
-                        "cond": {"$in": ["$$l.status", list(PRESENT_STATUSES)]},
-                    }},
-                    "as": "l",
-                    "in": {"$cond": [
-                        {"$eq": ["$$l.half_day", True]}, 0.5, 1.0
-                    ]},
-                }}},
-                "late_count": {"$size": {"$filter": {
-                    "input": "$_logs",
-                    "as": "l",
-                    "cond": {"$gt": ["$$l.late_minutes", 0]},
-                }}},
-                "is_working_day": {"$and": [
-                    {"$gte": [{"$dayOfWeek": "$_date"}, 2]},
-                    {"$lte": [{"$dayOfWeek": "$_date"}, 6]},
-                ]},
             }},
             {"$lookup": {
                 "from": "employees",
-                "let": {"day": "$_seed_date"},
-                "pipeline": [
-                    {"$match": {"$expr": {"$and": [
-                        {"$eq": ["$department", department]},
-                        {"$lte": ["$joined_on", "$$day"]},
-                    ]}}},
-                    {"$count": "count"},
-                ],
-                "as": "_hc",
+                "localField": "emp_code",
+                "foreignField": "emp_code",
+                "as": "employee",
             }},
-            {"$set": {
-                "headcount": {
-                    "$ifNull": [{"$arrayElemAt": ["$_hc.count", 0]}, 0]
-                },
-            }},
-            {"$set": {
-                "attendance_rate": {"$cond": [
-                    {"$and": [
-                        "$is_working_day",
-                        {"$gt": ["$headcount", 0]},
-                    ]},
-                    {"$round": [
-                        {"$divide": ["$present_count", "$headcount"]}, 4
-                    ]},
-                    None,
-                ]},
-            }},
-            {"$setWindowFields": {
-                "sortBy": {"_date": 1},
-                "output": {
-                    "moving_avg_7d": {
-                        "$avg": "$attendance_rate",
-                        "window": {"documents": [-6, 0]},
-                    },
-                },
-            }},
-            {"$set": {"date": "$_seed_date"}},
+            {"$unwind": "$employee"},
+            {"$match": {"employee.department": department}},
             {"$project": {
                 "_id": 0,
                 "date": 1,
-                "present_count": 1,
-                "late_count": 1,
-                "headcount": 1,
-                "is_working_day": 1,
-                "attendance_rate": 1,
-                "moving_avg_7d": 1,
+                "emp_code": 1,
+                "status": 1,
+                "late_minutes": 1,
+                "half_day": 1,
             }},
-            {"$sort": {"date": 1}},
         ]
 
-        # Correct form: send the database-level aggregate command directly
-        # with explain=True. Do not wrap aggregate=1 inside an explain command.
         return {
             "endpoint": endpoint,
-            "collection": "database",
+            "collection": "attendance_logs",
             "explain": explain_json({
-                "aggregate": 1,
-                "pipeline": pipeline,
-                "cursor": {},
-                "explain": True,
+                "explain": {
+                    "aggregate": "attendance_logs",
+                    "pipeline": explain_pipeline,
+                    "cursor": {},
+                },
+                "verbosity": "executionStats",
             }),
         }
 

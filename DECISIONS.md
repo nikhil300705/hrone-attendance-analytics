@@ -1,11 +1,11 @@
 # DECISIONS.md
 
-1. **Indexes.** A unique index on `employees.emp_code` prevents duplicate employee codes. A unique compound index on `attendance_logs.emp_code` and `date` prevents multiple records for one employee on the same attendance date. An index on `date` and `emp_code` supports date-based attendance queries. An index on `status` and `date` supports status/date filters. Additional indexes should be justified by query plans and measured workloads.
+1. **Indexes.** A unique index on `employees.emp_code` prevents duplicate employee codes. A unique compound index on `attendance_logs.emp_code` and `date` guarantees one attendance record per employee per attendance day. The `date`/`emp_code` index supports date-filtered attendance queries, while the `status`/`date` index supports status-and-date filters. The department/join-date index supports headcount queries.
 
-2. **Punch-in race.** Two requests can both check for an existing record before either inserts. The unique compound index is the final protection: one insert succeeds, and the other must catch the duplicate-key error and return HTTP 409. This depends on the endpoint handling that error correctly.
+2. **Punch-in race.** Concurrent requests may both attempt to insert the same attendance key. The unique database index allows one insert; the other raises a duplicate-key error that the endpoint converts to HTTP 409.
 
-3. **Ties.** The leaderboard sorts by late minutes descending and employee code ascending. Employees tied on late minutes receive the same competition rank. If a tie crosses the limit, all employees tied at that cutoff are included.
+3. **Ties.** The leaderboard uses competition ranking, so employees with equal late-minute totals share a rank. The cutoff is applied after ranking, so every employee tied at the cutoff is returned.
 
-4. **Headcount.** Headcount is based on employees whose joining date is on or before the period end, not just employees with attendance logs. Employees with zero logs can therefore still count.
+4. **Headcount.** Department headcount comes from employees who joined on or before the period end, independently of their attendance logs. Employees with no logs are therefore still counted.
 
-5. **Scaling.** For 100 times the data, I would move analytics calculations into indexed MongoDB aggregation pipelines and use execution statistics to identify bottlenecks.
+5. **Scaling.** For 100 times the data, I would profile execution statistics on realistic workloads, tune compound indexes to match common filters and sorts, and consider precomputed monthly summaries if measured analytics latency justified the added maintenance cost.

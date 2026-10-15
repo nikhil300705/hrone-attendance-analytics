@@ -148,3 +148,7 @@ The data model and implementation decisions are documented in [`DATA_MODEL.md`](
 ## Project Status
 
 This repository was created as a technical assignment for the **Software Engineer Trainee** role at HROne. The API has been smoke-tested against the configured MongoDB database; comprehensive automated testing of all business-rule edge cases remains a separate verification step.
+
+## Known limitation
+
+The department-trend explain endpoint currently explains the indexed attendance-log query feeding the trend, rather than the complete gap-filling trend pipeline. Basic smoke tests pass, but full hidden-dataset correctness has not been exhaustively verified.

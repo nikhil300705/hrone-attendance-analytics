@@ -1,18 +1,22 @@
 # REVIEW.md
 
-## Review of the attendance API
+## Review of the attendance API starter
 
-| # | Area | Defect or risk | How to test | Required correction |
+| # | Location | Defect identified | How to notice it | Correction |
 |---|---|---|---|---|
-| 1 | Late-minute calculation | The strict 10-minute grace boundary must be handled correctly, while reported late minutes represent full elapsed minutes. | For a 09:30 shift, test 09:40:00, 09:40:01, and 10:15:59. | Count lateness only when elapsed time is strictly greater than 10 minutes, and floor elapsed minutes. |
-| 2 | Work-hour rounding | Python's built-in round uses ties-to-even, not the required decimal half-up rule. | Test a duration whose hours value is halfway between two hundredths. | Round elapsed seconds divided by 3600 to two decimals using half-up rounding. |
-| 3 | Overtime calculation | The 30-minute minimum and overnight shift-end handling must both be enforced. | Test overtime below 30 minutes, exactly 30 minutes, and an overnight shift. | Resolve the correct shift-end instant and count only whole overtime minutes when the duration is at least 30 minutes. |
-| 4 | Request validation | Employee fields, timestamps, and attendance statuses must follow the API contract. | Try malformed employee codes, invalid email addresses, unsupported statuses, and invalid epoch values. | Validate formats, ranges, allowed values, and equal shift start/end times. |
-| 5 | Duplicate employee creation | A pre-insert existence check alone cannot prevent concurrent duplicate requests. | Send concurrent requests with the same employee code. | Enforce a unique database index and translate duplicate-key errors to HTTP 409. |
-| 6 | Attendance operations | Duplicate records, invalid punch ordering, 24-hour limits, and IST dates for overnight shifts require strict validation. | Test duplicate punch-ins, punch-out before punch-in, and overnight shifts. | Apply the contract rules and enforce attendance uniqueness in MongoDB. |
-| 7 | Analytics | Sample responses do not prove correct aggregation, rounding, join-date handling, or inclusion of employees without logs. | Test weekends, mid-month joining dates, half-days, ties, and employees with no logs. | Verify every calculation against the assignment requirements and OpenAPI contract. |
-| 8 | Department trend and explain plans | The required MongoDB `$densify` stage and representative execution-plan checks must be verified. | Inspect the trend pipeline and run explain with execution statistics. | Use the required aggregation stages and check index usage on the actual query shapes. |
+| 1 | `parse_date` | Parsing a date without enforcing the contract's exact `YYYY-MM-DD` format can accept unintended representations. | Submit a date such as `2026-7-1` or an impossible calendar date. | Validate the exact format and then validate the calendar date; invalid input returns HTTP 422. |
+| 2 | `epoch_ms`, `as_ist`, `clean_doc` | MongoDB datetimes and API timestamps must be converted consistently, with naive MongoDB datetimes interpreted as UTC. Internal MongoDB identifiers must not leak into API responses. | Inspect timestamp types in employee, attendance, and history responses. | Normalize datetimes and serialize instants as epoch milliseconds; omit internal `_id` and `id` fields. |
+| 3 | `EmployeeIn` | Input validation needs to reject malformed email addresses and invalid shift/date values. A normal model method is not a Pydantic model validator. | Submit an invalid email, malformed date, invalid shift, or equal shift start/end values. | Add explicit field validation and a model-level check that shift start and end differ. |
+| 4 | `/health` | Returning success without contacting MongoDB can report a healthy service while the database is unavailable. | Stop or make the database unavailable and request `/health`. | Ping MongoDB and return HTTP 503 when the database cannot be reached. |
+| 5 | `regularize_attendance` | Concurrent corrections must not overwrite one another's audit history silently. | Submit two corrections concurrently for the same attendance record. | Use a conditional update based on the previously read history and return HTTP 409 when another update wins. |
 
-## Verification status
+## Behavior reviewed and retained
 
-This review identifies important contract requirements and risks. Each finding must be confirmed against the original starter code and the assignment specification before it is considered a verified original defect. Basic endpoint smoke tests alone do not establish full correctness or performance compliance.
+- `compute_late_minutes` applies the strict 10-minute grace boundary and reports whole elapsed minutes.
+- `compute_work_hours` uses decimal half-up rounding to two decimal places.
+- `compute_overtime` applies the 30-minute minimum and accounts for overnight shifts when shift information is supplied.
+- Unique database indexes protect employee codes and the employee/date attendance key.
+
+## Verification notes
+
+Terminal smoke tests returned HTTP 200 for the main API and all five explain endpoints. The department trend returned seven consecutive daily rows for the tested date range, and the tested explain plans contained `IXSCAN` without `COLLSCAN`. Concurrent punch-ins, punch-outs, and regularization produced the expected one-success/one-conflict behavior. These checks do not replace testing against the full hidden dataset.
